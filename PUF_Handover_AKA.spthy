@@ -6,7 +6,7 @@ builtins: hashing, xor
 /* Define functions: 
 */
 functions: 
-    PUF1/1,  PUF2/1, [private]   
+    PUF1/1 [private],  PUF2/1 [private],   
     fst/1, snd/1, ascon_enc/4,   
     ascon_dec/4   [private]   
 
