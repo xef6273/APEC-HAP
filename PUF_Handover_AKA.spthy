@@ -1,0 +1,222 @@
+theory Test
+begin
+
+builtins: hashing, xor
+
+/* Define functions: 
+*/
+functions: 
+    PUF1/1,  PUF2/1, [private]   
+    fst/1, snd/1, ascon_enc/4,   
+    ascon_dec/4   [private]   
+
+equations: 
+    ascon_dec(k1, k2, k3, ascon_enc( k1, k2, k3, pt) ) = pt
+// -----------------------------
+// (Protocol Rules)
+// -----------------------------
+
+// [Register phase]
+rule Register:
+    let 
+        // UAV side computations
+        r1_old = PUF1(~c1_old)
+        c_old = ~c1_old XOR ~c2_old
+        r_old = PUF1(c_old) 
+        hid_old = r1_old XOR ~c2_old 
+        tid_old = h(<~id_uav, r_old>)
+        w_old   = h(<~c1_old, r_old>) 
+        // Ground Station side computations
+        r_gs = PUF2(~c_gs)
+        K = r_gs XOR ~k_gs 
+        q = h(<tid_old, ~k_gs>)     
+          
+        q2 = q XOR ~r 
+        pt = <tid_old, r_old, w_old>     // Plaintext
+        //ct4 = senc(pt, q)
+        ct4 = ascon_enc(q, ~r, q2, pt) 
+
+    in
+    [ Fr(~id_uav), Fr(~id_GS), Fr(~c_gs), Fr(~k_gs), Fr(~c1_old), Fr(~c2_old), Fr(~r) ]
+  --[ Setup(~id_uav, ~id_GS), Secret(~k_gs), Honest(~id_uav), Honest(~id_GS) ]->
+    [ 
+        
+        !GS_DB(~id_GS, ~c_gs, K, ~id_uav, ~c1_old, ~r), 
+        !UAV_CRED(~id_uav, ~id_GS, ~c1_old, tid_old, hid_old, ct4, ~r) 
+        
+    ]
+
+// [Strp 1]：UAV request
+rule UAV_Step1:
+    let
+        C2_i2 = HID_i2 XOR PUF1(C1_i2) 
+        C1_i3 = C2_i2 XOR C1_i2 
+        R_i2 = PUF1(C1_i3)
+        TID_i2 = h(<ID, R_i2>)
+        M2 = h(<TID_i2, ~n3, ct4>)
+        RN_i = R_i2 XOR <~n3, M2>
+    in
+    [ Fr(~n3), Fr(~tid), 
+        !UAV_CRED(ID, GSID, C1_i2, TID_i2, HID_i2, ct4, r) ] 
+  --[ StartUAVSession(ID), Honest(ID) ]->
+    [ 
+        State_UAV_1(~tid, ID, GSID, C1_i2, R_i2, ~n3, ct4, TID_i2, r), 
+        Out(<'M895', ~tid, C1_i2, TID_i2, ct4, RN_i>) 
+    ]
+
+// [Step 2]：GS response
+rule GS_Step1:
+    let
+        R_calc = PUF2(c_gs) 
+        K_calc = R_calc XOR K
+        q_verify = h(<TID_i2, K_calc>)
+        q2_db = q_verify XOR r 
+        plaintext = ascon_dec(q_verify, r, q2_db, ct4) 
+        //plaintext = sdec(ct4, q_verify)  
+        tid_dec = fst(plaintext)
+        r_dec = fst(snd(plaintext))
+        w_dec = snd(snd(plaintext))
+                
+        // Decrption response
+        recovered = RN_i XOR r_dec
+        n3_rec = fst(recovered)
+        M2_rec = snd(recovered)
+        
+        SK2 = h(<tid_dec, GSID, C1_i2, r_dec, n3_rec, ~n4>) 
+        M3 = h(<SK2, n3_rec, ~n4, GSID>)
+        pt = <M3, ~n4>     // Plaintext
+        ct5 = ascon_enc(r_dec, C1_i2, n3_rec, pt) 
+        //ct5 = senc(pt, r_dec)      
+        //msg_out = senc(<M3, ~n4>, R_calc)
+    in
+    [ In(<'M895', tid, C1_i2, TID_i2, ct4, RN_i>), !GS_DB(GSID, c_gs, K, UAV_ID, C1_i2, r), Fr(~n4) ]
+  --[ 
+        //Eq(auth_dec, ap4),
+        Eq(tid_dec, TID_i2), 
+        Eq(M2_rec, h(<TID_i2, n3_rec, ct4>)),  
+        Eq(w_dec, h(<C1_i2, r_dec>)),
+        Running(GSID, UAV_ID, <'GS', 'UAV', SK2>),
+       // Commit(GSID, UAV_ID, <'GS', 'UAV', SK2>),  
+        Secret(SK2),
+        Honest(GSID), 
+        Honest(UAV_ID)
+       //GS_END()  
+    ]->
+    [  State_GS_1(tid, GSID, UAV_ID, C1_i2, n3_rec, ~n4, SK2, r), 
+        Out(<'M896', tid, ct5>) 
+    ]
+
+// [Step 3]：UAV authentication
+rule UAV_Step2:
+    let
+        plaintext = ascon_dec(R_i2, C1_i2, n3_stored, ct5) 
+        //plaintext = sdec(ct5, R_i2)
+        M3_recv = fst(plaintext)
+        n4_recv  = snd(plaintext)
+        
+        SK2_calc = h(<TID_i2, GSID, C1_i2, R_i2, n3_stored, n4_recv>)
+        M3_check = h(<SK2_calc, n3_stored, n4_recv,GSID>)
+        M4 = h(<SK2_calc, n4_recv>)   
+    in
+    [ State_UAV_1(tid, ID, GSID, C1_i2, R_i2, n3_stored, ct4, TID_i2, r), In(<'M896', tid, ct5>) ]
+  --[ 
+        
+        Eq(M3_recv, M3_check),
+        Commit(ID, GSID, <'UAV', 'GS', SK2_calc>),
+        Running(ID, GSID, <'UAV', 'GS', SK2_calc>),
+        Secret(SK2_calc),
+        Honest(ID),
+        UAV_END()
+    ]->
+    [ State_UAV_2(tid, ID, SK2_calc) , Out(<'M897', tid, M4>) ]  
+
+
+
+rule GS_Step2:
+    let
+        M4_expected = h(<SK2, n4>)
+    in
+    [ State_GS_1(tid, GSID, UAV_ID, C1_i2, n3_rec, n4, SK2, r), 
+      In(<'M897', tid, M4>) ]
+  --[ 
+        Eq(M4, M4_expected),
+        Commit(GSID, UAV_ID, <'GS', 'UAV', SK2>),
+        Honest(GSID),
+        GS_END()
+    ]->
+    [ ]
+// -----------------------------
+// Adversary Model and Rules
+// -----------------------------
+rule Reveal_UAV:
+    [ !UAV_CRED(ID, GSID, C1, TID, HID, ct, r) ] --[ Reveal('UAV', ID) ]->  [ Out(<ct, TID>) ] 
+
+rule Reveal_GS:
+    [ !GS_DB(GSID, C, K, ID, C1, r) ] --[ Reveal('GS', GSID) ]-> [ Out(K) ]
+    //[ !GS_Key(GSID, k) ] --[ Reveal('GS_KEY', GSID) ]-> [ Out(k) ]
+
+restriction Equality:
+    "All x y #i. Eq(x,y) @i ==> x = y"
+
+// -----------------------------
+//  (Lemmas)
+// -----------------------------
+
+// 1. Liveness Verification: To ensure the feasibility of the proposed protocol.
+lemma trace_exists:
+    exists-trace
+    "Ex #i #j. UAV_END() @i & GS_END() @j"
+
+// 2. Key Secrecy
+lemma SK2_Secrecy:
+    "All Key #i. Secret(Key) @i 
+        ==> (not (Ex #j. K(Key) @j))
+        | (Ex id #r. Reveal('UAV', id) @r & (Ex #h. Honest(id) @h))
+        | (Ex gs #r. Reveal('GS', gs) @r & (Ex #h. Honest(gs) @h))"
+
+// 3. UAV authenticate GS  (MIMT)
+
+lemma UAV_Injective_Agreement_On_SK2:
+    "All uav gs t #i. Commit(uav, gs, <'UAV', 'GS', t>) @i
+    ==> (Ex #j. Running(gs, uav, <'GS', 'UAV', t>) @j & j < i
+          & not (Ex #i2. Commit(uav, gs, <'UAV', 'GS', t>) @i2 & not(#i2 = #i)))
+        | (Ex #r. Reveal('UAV', uav) @r)
+        | (Ex #r. Reveal('GS', gs) @r)"
+
+// 4. GS authenticate UAV  (Mutual authentication)
+lemma GS_Agreement_On_SK2:
+    "All gs uav t #i. Commit(gs, uav, <'GS', 'UAV', t>) @i
+    ==> (Ex #j. Running(uav, gs, <'UAV', 'GS', t>) @j & j < i)
+        | (Ex #r. Reveal('UAV', uav) @r)
+        | (Ex #r. Reveal('GS', gs) @r)"
+
+
+lemma GS_Injective_Agreement_On_SK2:
+    "All gs uav t #i. 
+        Commit(gs, uav, <'GS', 'UAV', t>) @i
+    ==> (Ex #j. Running(uav, gs, <'UAV', 'GS', t>) @j 
+              & j < i
+              & not (Ex gs2 #i2. 
+                       Commit(gs2, uav, <'GS', 'UAV', t>) @i2 
+                       & not (#i2 = #i)))
+        | (Ex #r. Reveal('GS', gs) @r)"
+
+lemma UAV_NonInjective_Agreement_On_SK2:
+    "All uav gs t #i. 
+        Commit(uav, gs, <'UAV', 'GS', t>) @i
+
+    ==> (Ex #j. Running(gs, uav, <'GS', 'UAV', t>) @j & j < i)
+        | (Ex #r. Reveal('GS', gs) @r)"
+
+lemma GS_NonInjective_Agreement_On_SK2:
+    "All gs uav t #i. Commit(gs, uav, <'GS', 'UAV', t>) @i
+    ==> (Ex #j. Running(uav, gs, <'UAV', 'GS', t>) @j & j < i)
+        | (Ex #r. Reveal('GS', gs) @r)"
+
+lemma Perfect_Forward_Secrecy:
+  "All key #i. Secret(key) @i
+    ==> (not (Ex #j. K(key) @j)) 
+    | (Ex entity id #r. Reveal(entity, id) @r & i < r)" 
+   //The key must remain secure even if a compromise occurs at time #r, subsequent to the key generation event at time #i.
+
+end
